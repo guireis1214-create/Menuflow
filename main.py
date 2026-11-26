@@ -4,14 +4,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 import sqlite3
-import os
 from pathlib import Path
 from datetime import datetime
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT)))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "menuflow.db"
+ROOT = Path(__file__).resolve().parent.parent
+DB_PATH = Path(__file__).resolve().parent / "menuflow.db"
 app = FastAPI(title="MenuFlow API", version="1.0.0")
 
 app.add_middleware(
@@ -31,6 +28,15 @@ def db():
 def init_db():
     with db() as con:
         con.executescript("""
+        CREATE TABLE IF NOT EXISTS restaurants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, owner TEXT NOT NULL,
+            email TEXT NOT NULL, phone TEXT DEFAULT '', address TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'Pendente', created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS customer_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+            phone TEXT DEFAULT '', created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'Geral',
@@ -43,6 +49,11 @@ def init_db():
             name TEXT NOT NULL, category TEXT DEFAULT 'Geral',
             quantity REAL NOT NULL DEFAULT 0, minimum REAL NOT NULL DEFAULT 0,
             expiry TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS stock_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, stock_id INTEGER NOT NULL,
+            kind TEXT NOT NULL, quantity REAL NOT NULL, note TEXT DEFAULT '', created_at TEXT NOT NULL,
+            FOREIGN KEY(stock_id) REFERENCES stock(id)
         );
         CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,8 +168,61 @@ def health():
 def login(payload: dict):
     # Demo login for classroom prototype; replace with real hashed-password auth before production.
     if payload.get("username") in ("admin", "admin@menuflow.com") and payload.get("password") == "123456":
-        return {"ok": True, "user": "Administrador"}
+        return {"ok": True, "user": "Administrador", "role": "admin"}
+    if payload.get("username") in ("cliente", "client", "cliente@menuflow.com") and payload.get("password") == "123456":
+        return {"ok": True, "user": "Cliente", "role": "client"}
+    if payload.get("username") in ("suporte", "support", "suporte@menuflow.com") and payload.get("password") == "123456":
+        return {"ok": True, "user": "Suporte MenuFlow", "role": "platform"}
     raise HTTPException(401, "Usuário ou senha inválidos. Use admin / 123456 para demonstração.")
+
+@app.get("/api/client/restaurants")
+def client_restaurants():
+    return rows("SELECT id,name,address FROM restaurants WHERE status=\'Aprovado\' ORDER BY name")
+
+@app.get("/api/client/products")
+def client_products():
+    return rows("SELECT id,name,category,price,description,available FROM products WHERE available=1 ORDER BY category,name")
+
+@app.post("/api/client/orders")
+def client_create_order(payload: dict):
+    customer=str(payload.get("customer", "Cliente" )).strip() or "Cliente"
+    items=str(payload.get("items", "")).strip()
+    total=float(payload.get("total",0))
+    if not items or total <= 0: raise HTTPException(400,"Pedido e valor são obrigatórios")
+    now=datetime.now().isoformat(timespec="minutes")
+    i=insert("orders",["customer","items","total","status","prep_minutes","created_at"],[customer,items,total,"Aguardando",15,now])
+    return rows("SELECT * FROM orders WHERE id=?",(i,))[0]
+
+@app.post("/api/client/register")
+def client_register(payload: dict):
+    name=str(payload.get("name", "")).strip(); email=str(payload.get("email", "")).strip().lower(); phone=str(payload.get("phone", "")).strip()
+    if not name or not email: raise HTTPException(400, "Nome e e-mail são obrigatórios")
+    try: i=insert("customer_accounts", ["name","email","phone","created_at"], [name,email,phone,datetime.now().isoformat(timespec="minutes")])
+    except sqlite3.IntegrityError: raise HTTPException(409, "Este e-mail já está cadastrado")
+    return rows("SELECT id,name,email,phone FROM customer_accounts WHERE id=?",(i,))[0]
+
+@app.get("/api/platform/restaurants")
+def platform_restaurants():
+    return rows("SELECT * FROM restaurants ORDER BY id DESC")
+
+@app.post("/api/platform/restaurants")
+def restaurant_request(payload: dict):
+    name=str(payload.get("name", "")).strip(); owner=str(payload.get("owner", "")).strip(); email=str(payload.get("email", "")).strip(); phone=str(payload.get("phone", "")).strip(); address=str(payload.get("address", "")).strip()
+    if not name or not owner or not email: raise HTTPException(400,"Estabelecimento, responsável e e-mail são obrigatórios")
+    i=insert("restaurants", ["name","owner","email","phone","address","status","created_at"],[name,owner,email,phone,address,"Pendente",datetime.now().isoformat(timespec="minutes")])
+    return rows("SELECT * FROM restaurants WHERE id=?",(i,))[0]
+
+@app.patch("/api/platform/restaurants/{restaurant_id}")
+def restaurant_status(restaurant_id:int, payload:dict):
+    status=str(payload.get("status",""))
+    if status not in ("Pendente","Aprovado","Suspenso"): raise HTTPException(400,"Status inválido")
+    with db() as con: cur=con.execute("UPDATE restaurants SET status=? WHERE id=?",(status,restaurant_id))
+    if cur.rowcount==0: raise HTTPException(404,"Cadastro não encontrado")
+    return rows("SELECT * FROM restaurants WHERE id=?",(restaurant_id,))[0]
+
+@app.get("/api/platform/customers")
+def platform_customers():
+    return rows("SELECT id,name,email,phone,created_at FROM customer_accounts ORDER BY id DESC")
 
 @app.get("/api/dashboard")
 def dashboard():
@@ -210,6 +274,23 @@ def update_stock(item_id: int, s: StockIn):
             [s.name,s.category,s.quantity,s.minimum,s.expiry,item_id])
         if not cur.rowcount: raise HTTPException(404,"Item não encontrado")
     return rows("SELECT * FROM stock WHERE id=?", (item_id,))[0]
+
+@app.get("/api/stock/movements")
+def get_stock_movements():
+    return rows("SELECT m.*, s.name AS item_name FROM stock_movements m JOIN stock s ON s.id=m.stock_id ORDER BY m.id DESC")
+
+@app.post("/api/stock/movements")
+def create_stock_movement(payload: dict):
+    stock_id=int(payload.get("stock_id",0)); kind=payload.get("kind"); qty=float(payload.get("quantity",0)); note=str(payload.get("note", ""))
+    if kind not in ["Entrada","Saída"] or qty <= 0: raise HTTPException(400,"Tipo e quantidade válida são obrigatórios")
+    with db() as con:
+        item=con.execute("SELECT quantity FROM stock WHERE id=?",(stock_id,)).fetchone()
+        if not item: raise HTTPException(404,"Item de estoque não encontrado")
+        newqty=item[0]+qty if kind=="Entrada" else item[0]-qty
+        if newqty < 0: raise HTTPException(400,"Saída maior que o estoque disponível")
+        con.execute("UPDATE stock SET quantity=? WHERE id=?",(newqty,stock_id))
+        con.execute("INSERT INTO stock_movements(stock_id,kind,quantity,note,created_at) VALUES(?,?,?,?,?)",(stock_id,kind,qty,note,datetime.now().isoformat(timespec="minutes")))
+    return {"ok":True,"quantity":newqty}
 
 @app.get("/api/employees")
 def get_employees():
